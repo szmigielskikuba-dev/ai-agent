@@ -1,0 +1,4 @@
+claude-agent-sdk
+anthropic
+anyio
+python-dotenv
