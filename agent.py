@@ -1,20 +1,26 @@
 """
 Internet Browsing Agent powered by Claude
 
-This agent can search the web, fetch pages, and interact with
-Facebook Marketplace — finding listings and sending messages to sellers.
+This agent can search the web, fetch pages, interact with Facebook Marketplace,
+and sign up to gyms by submitting your contact details on their websites.
 
 Usage:
     python agent.py                          # interactive mode (general browsing)
     python agent.py --marketplace            # interactive mode (marketplace focus)
+    python agent.py --gym-signup             # interactive mode (gym sign-up focus)
     python agent.py "search query"           # one-shot general query
     python agent.py --marketplace "query"    # one-shot marketplace query
+    python agent.py --gym-signup "gyms in Austin TX"  # find & sign up to gyms
+
+Gym sign-up notes:
+  - Set GYM_CONTACT_NAME and GYM_CONTACT_PHONE in your .env file.
+  - A browser window will open via Playwright to fill out contact forms.
+  - The agent will show you each form before submitting and ask for confirmation.
 
 Facebook Marketplace notes:
   - The agent will open a real browser window via Playwright.
   - You must log into Facebook manually on first run.
   - Your browser session is saved in ./browser-profile/ for future runs.
-  - Automated messaging on Facebook may be subject to their Terms of Service.
 """
 
 import os
@@ -35,6 +41,34 @@ GENERAL_SYSTEM_PROMPT = """You are a helpful internet browsing assistant. You ca
 
 Always cite your sources by mentioning the URLs you visited.
 Be concise but thorough in your responses."""
+
+GYM_SIGNUP_SYSTEM_PROMPT = """You are a gym sign-up assistant. You help users register their contact details on gym websites so gyms can call them back.
+
+## Your workflow
+
+1. **Find gyms**: Search Google for gyms matching the user's query (e.g. "CrossFit gyms in Austin TX").
+   Collect a list of gym names and their website URLs.
+
+2. **For each gym website**:
+   a. Navigate to the gym's website.
+   b. Look for a contact/sign-up/free trial/callback request form. Common locations:
+      - A "Free Trial", "Join Now", or "Get Started" button
+      - A "Contact Us" page
+      - A pop-up or banner asking for contact details
+      - A footer form
+   c. Fill in the user's name and phone number in the appropriate fields.
+      Leave any fields you're unsure about empty rather than guessing.
+   d. **Show the user exactly what you are about to submit** and ask for confirmation.
+   e. Only submit after the user says yes.
+
+3. **Report results**: After each gym, report whether the sign-up succeeded or failed (e.g. no form found, CAPTCHA, form error).
+
+## Rules
+- Never submit a form without explicit user confirmation.
+- Never fill in fields other than name and phone (e.g. do not enter payment info).
+- If a CAPTCHA appears, pause and ask the user to solve it.
+- If you cannot find a contact form after checking the homepage and "Contact" / "Join" pages, skip that gym and note it in your report.
+- Do not create accounts or set passwords on behalf of the user."""
 
 MARKETPLACE_SYSTEM_PROMPT = """You are a Facebook Marketplace assistant. You help users find listings and contact sellers.
 
@@ -81,14 +115,24 @@ def get_playwright_mcp_config() -> dict:
     }
 
 
-async def run_agent(prompt: str, marketplace_mode: bool = False) -> str:
+async def run_agent(prompt: str, marketplace_mode: bool = False, gym_signup_mode: bool = False) -> str:
     """Run the browsing agent and return the result."""
     result_text = ""
 
-    if marketplace_mode:
+    if gym_signup_mode:
+        name = os.getenv("GYM_CONTACT_NAME", "")
+        phone = os.getenv("GYM_CONTACT_PHONE", "")
+        if not name or not phone:
+            print("Error: Set GYM_CONTACT_NAME and GYM_CONTACT_PHONE in your .env file.")
+            return ""
+        contact_info = f"Name: {name}\nPhone: {phone}"
+        system_prompt = GYM_SIGNUP_SYSTEM_PROMPT + f"\n\n## Contact details to submit\n{contact_info}"
+        mcp_servers = {"playwright": get_playwright_mcp_config()}
+        allowed_tools = None
+    elif marketplace_mode:
         system_prompt = MARKETPLACE_SYSTEM_PROMPT
         mcp_servers = {"playwright": get_playwright_mcp_config()}
-        allowed_tools = []  # use all MCP tools from playwright
+        allowed_tools = None
     else:
         system_prompt = GENERAL_SYSTEM_PROMPT
         mcp_servers = {}
@@ -97,11 +141,11 @@ async def run_agent(prompt: str, marketplace_mode: bool = False) -> str:
     async for message in query(
         prompt=prompt,
         options=ClaudeAgentOptions(
-            allowed_tools=allowed_tools if allowed_tools else None,
+            allowed_tools=allowed_tools,
             mcp_servers=mcp_servers,
             system_prompt=system_prompt,
             model="claude-opus-4-6",
-            max_turns=20,
+            max_turns=30,
         ),
     ):
         if isinstance(message, ResultMessage):
@@ -114,9 +158,13 @@ async def run_agent(prompt: str, marketplace_mode: bool = False) -> str:
     return result_text
 
 
-async def interactive_mode(marketplace_mode: bool = False):
+async def interactive_mode(marketplace_mode: bool = False, gym_signup_mode: bool = False):
     """Run the agent in interactive mode."""
-    if marketplace_mode:
+    if gym_signup_mode:
+        print("Gym Sign-Up Agent (powered by Claude + Playwright)")
+        print("Make sure GYM_CONTACT_NAME and GYM_CONTACT_PHONE are set in .env")
+        print("A browser window will open to fill in your contact details.")
+    elif marketplace_mode:
         print("Facebook Marketplace Agent (powered by Claude + Playwright)")
         print("A browser window will open. Log into Facebook if prompted.")
     else:
@@ -137,7 +185,7 @@ async def interactive_mode(marketplace_mode: bool = False):
             break
 
         print("\nAgent: ", end="", flush=True)
-        result = await run_agent(user_input, marketplace_mode=marketplace_mode)
+        result = await run_agent(user_input, marketplace_mode=marketplace_mode, gym_signup_mode=gym_signup_mode)
         if result and not result.endswith("\n"):
             print()
         print()
@@ -146,18 +194,23 @@ async def interactive_mode(marketplace_mode: bool = False):
 async def main():
     args = sys.argv[1:]
     marketplace_mode = "--marketplace" in args
-    if marketplace_mode:
-        args = [a for a in args if a != "--marketplace"]
+    gym_signup_mode = "--gym-signup" in args
+    args = [a for a in args if a not in ("--marketplace", "--gym-signup")]
 
     if args:
         prompt = " ".join(args)
-        mode_label = "Marketplace" if marketplace_mode else "Browsing"
-        print(f"{mode_label} search: {prompt}\n")
-        result = await run_agent(prompt, marketplace_mode=marketplace_mode)
+        if gym_signup_mode:
+            mode_label = "Gym sign-up"
+        elif marketplace_mode:
+            mode_label = "Marketplace"
+        else:
+            mode_label = "Browsing"
+        print(f"{mode_label}: {prompt}\n")
+        result = await run_agent(prompt, marketplace_mode=marketplace_mode, gym_signup_mode=gym_signup_mode)
         if result:
             print(f"\nResult: {result}")
     else:
-        await interactive_mode(marketplace_mode=marketplace_mode)
+        await interactive_mode(marketplace_mode=marketplace_mode, gym_signup_mode=gym_signup_mode)
 
 
 if __name__ == "__main__":
