@@ -1,0 +1,4 @@
+.env
+browser-profile/
+__pycache__/
+*.pyc
